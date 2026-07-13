@@ -28,8 +28,10 @@ import {
 } from './data';
 
 import { onAuthStateChanged, User } from 'firebase/auth';
+import { collection, getDocs } from 'firebase/firestore';
 import {
   auth,
+  db,
   logoutUser,
   isCollectionEmpty,
   seedInitialData,
@@ -98,6 +100,12 @@ export default function App() {
       await logoutUser();
       setCurrentUser(null);
       setIsGuestMode(false);
+      
+      // Reset state to default values so user's data isn't exposed in offline/guest mode after sign out
+      setProfile(DEFAULT_COMPANY_PROFILE);
+      setClients(DEFAULT_CLIENTS);
+      setProducts(DEFAULT_PRODUCTS);
+      setDocuments(DEFAULT_DOCUMENTS);
     } catch (error) {
       console.error('Error logging out:', error);
     }
@@ -221,17 +229,88 @@ export default function App() {
       if (!currentUser) return;
       const uid = currentUser.uid;
       try {
-        const isProfileEmpty = await isCollectionEmpty(uid, 'profile');
-        const isClientsEmpty = await isCollectionEmpty(uid, 'clients');
-        const isProductsEmpty = await isCollectionEmpty(uid, 'products');
-        const isDocsEmpty = await isCollectionEmpty(uid, 'documents');
+        // 1. Fetch current cloud state to do intelligent merge checking
+        const cloudDocsSnap = await getDocs(collection(db, 'users', uid, 'documents'));
+        const cloudClientsSnap = await getDocs(collection(db, 'users', uid, 'clients'));
+        const cloudProductsSnap = await getDocs(collection(db, 'users', uid, 'products'));
+        const cloudProfileSnap = await getDocs(collection(db, 'users', uid, 'profile'));
 
-        if (isProfileEmpty && isClientsEmpty && isProductsEmpty && isDocsEmpty) {
-          // Empty cloud db, upload local state as seed
+        const cloudDocIds = new Set(cloudDocsSnap.docs.map(d => d.id));
+        const cloudClientIds = new Set(cloudClientsSnap.docs.map(c => c.id));
+        const cloudProductIds = new Set(cloudProductsSnap.docs.map(p => p.id));
+
+        let cloudProfile: CompanyProfile | null = null;
+        cloudProfileSnap.forEach(docSnap => {
+          if (docSnap.id === 'company') {
+            cloudProfile = docSnap.data() as CompanyProfile;
+          }
+        });
+
+        // 2. Perform merging (Local -> Cloud)
+        const isCloudEntirelyEmpty = cloudDocsSnap.empty && cloudClientsSnap.empty && cloudProductsSnap.empty && !cloudProfile;
+
+        if (isCloudEntirelyEmpty) {
+          // If the cloud database is completely fresh, seed it with all current local data (including defaults)
           await seedInitialData(uid, profile, clients, products, documents);
+        } else {
+          // Cloud has existing data. Merge any new custom or modified local data into the cloud
+          const defaultDocIds = ['doc1', 'doc2', 'doc3', 'doc4'];
+          const defaultClientIds = ['c1', 'c2', 'c3'];
+          const defaultProductIds = ['p1', 'p2', 'p3', 'p4', 'p5', 'p6'];
+
+          // Helper checks to see if default data has been modified by the user
+          const isModifiedDefaultDoc = (docItem: Document) => {
+            const original = DEFAULT_DOCUMENTS.find(d => d.id === docItem.id);
+            if (!original) return false;
+            return JSON.stringify(docItem) !== JSON.stringify(original);
+          };
+
+          const isModifiedDefaultClient = (clientItem: Client) => {
+            const original = DEFAULT_CLIENTS.find(c => c.id === clientItem.id);
+            if (!original) return false;
+            return JSON.stringify(clientItem) !== JSON.stringify(original);
+          };
+
+          const isModifiedDefaultProduct = (productItem: Product) => {
+            const original = DEFAULT_PRODUCTS.find(p => p.id === productItem.id);
+            if (!original) return false;
+            return JSON.stringify(productItem) !== JSON.stringify(original);
+          };
+
+          // Merge local documents to cloud
+          for (const docItem of documents) {
+            const isDefault = defaultDocIds.includes(docItem.id);
+            const modified = isDefault && isModifiedDefaultDoc(docItem);
+            if (!cloudDocIds.has(docItem.id) && (!isDefault || modified)) {
+              await saveDocumentToCloud(uid, docItem);
+            }
+          }
+
+          // Merge local clients to cloud
+          for (const clientItem of clients) {
+            const isDefault = defaultClientIds.includes(clientItem.id);
+            const modified = isDefault && isModifiedDefaultClient(clientItem);
+            if (!cloudClientIds.has(clientItem.id) && (!isDefault || modified)) {
+              await saveClientToCloud(uid, clientItem);
+            }
+          }
+
+          // Merge local products to cloud
+          for (const productItem of products) {
+            const isDefault = defaultProductIds.includes(productItem.id);
+            const modified = isDefault && isModifiedDefaultProduct(productItem);
+            if (!cloudProductIds.has(productItem.id) && (!isDefault || modified)) {
+              await saveProductToCloud(uid, productItem);
+            }
+          }
+
+          // Merge profile to cloud if not exists on cloud
+          if (!cloudProfile) {
+            await saveCompanyProfileToCloud(uid, profile);
+          }
         }
 
-        // Establish real-time sync listeners
+        // 3. Establish real-time sync listeners to fetch and update local state
         unsubscribeProfile = listenToCompanyProfile(uid, (updatedProfile) => {
           if (updatedProfile) {
             setProfile(updatedProfile);
